@@ -30,19 +30,26 @@ import (
 	semconv "go.opentelemetry.io/collector/semconv/v1.16.0"
 )
 
-func addResourceData(req *http.Request, rs *pcommon.Resource) {
+type resourceMeta struct {
+	lang string
+	service string
+	version string
+}
+
+func addResourceAttrs(meta *resourceMeta, rs *pcommon.Resource) {
 	attrs := rs.Attributes()
 	attrs.Clear()
-	attrs.EnsureCapacity(3)
+	attrs.EnsureCapacity(4)
 	attrs.PutStr("telemetry.sdk.name", "Datadog")
-	ddTracerVersion := req.Header.Get("Datadog-Meta-Tracer-Version")
+	ddTracerVersion := meta.version
 	if ddTracerVersion != "" {
 		attrs.PutStr("telemetry.sdk.version", "Datadog-"+ddTracerVersion)
 	}
-	ddTracerLang := req.Header.Get("Datadog-Meta-Lang")
+	ddTracerLang := meta.lang
 	if ddTracerLang != "" {
 		attrs.PutStr("telemetry.sdk.language", ddTracerLang)
 	}
+	attrs.PutStr(semconv.AttributeServiceName, meta.service)
 }
 
 func toTraces(payload *pb.TracerPayload, req *http.Request) ptrace.Traces {
@@ -50,19 +57,28 @@ func toTraces(payload *pb.TracerPayload, req *http.Request) ptrace.Traces {
 	for _, p := range payload.GetChunks() {
 		traces = append(traces, p.GetSpans())
 	}
+	meta := &resourceMeta{
+		version: req.Header.Get("Datadog-Meta-Tracer-Version"),
+		lang: req.Header.Get("Datadog-Meta-Lang"),
+	}
 	dest := ptrace.NewTraces()
-	resSpans := dest.ResourceSpans().AppendEmpty()
-	resource := resSpans.Resource()
-	addResourceData(req, &resource)
-	resSpans.SetSchemaUrl(semconv.SchemaURL)
+	resSpansList := dest.ResourceSpans()
 
 	for _, trace := range traces {
-		ils := resSpans.ScopeSpans().AppendEmpty()
-		ils.Scope().SetName("Datadog-" + req.Header.Get("Datadog-Meta-Lang"))
-		ils.Scope().SetVersion(req.Header.Get("Datadog-Meta-Tracer-Version"))
-		spans := ptrace.NewSpanSlice()
-		spans.EnsureCapacity(len(trace))
 		for _, span := range trace {
+			spans := ptrace.NewSpanSlice()
+			spans.EnsureCapacity(1)
+
+			meta.service = span.Service
+			resSpans := resSpansList.AppendEmpty()
+			resource := resSpans.Resource()
+			resSpans.SetSchemaUrl(semconv.SchemaURL)
+			addResourceAttrs(meta, &resource)
+
+			ils := resSpans.ScopeSpans().AppendEmpty()
+			ils.Scope().SetName("Datadog-" + meta.lang)
+			ils.Scope().SetVersion(meta.version)
+
 			newSpan := spans.AppendEmpty()
 
 			newSpan.SetTraceID(uInt64ToTraceID(0, span.TraceID))
@@ -113,10 +129,10 @@ func toTraces(payload *pb.TracerPayload, req *http.Request) ptrace.Traces {
 					newSpan.SetKind(ptrace.SpanKindUnspecified)
 				}
 			}
-		}
-		spans.MoveAndAppendTo(ils.Spans())
-	}
 
+			spans.MoveAndAppendTo(ils.Spans())
+		}
+	}
 	return dest
 }
 
